@@ -27,6 +27,9 @@ class WhisperModel(faster_whisper.WhisperModel):
     FasterWhisperModel provides batched inference for faster-whisper.
     Currently only works in non-timestamp mode and fixed prompt for all samples in batch.
     '''
+    def __init__(self, *args, return_nbest=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.return_nbest = return_nbest
 
     def generate_segment_batched(self, features: np.ndarray, tokenizer: faster_whisper.tokenizer.Tokenizer, options: faster_whisper.transcribe.TranscriptionOptions, encoder_output = None):
         batch_size = features.shape[0]
@@ -49,7 +52,7 @@ class WhisperModel(faster_whisper.WhisperModel):
         max_initial_timestamp_index = int(
             round(options.max_initial_timestamp / self.time_precision)
         )
-
+        
         result = self.model.generate(
                 encoder_output,
                 [prompt] * batch_size,
@@ -59,20 +62,62 @@ class WhisperModel(faster_whisper.WhisperModel):
                 max_length=self.max_length,
                 suppress_blank=options.suppress_blank,
                 suppress_tokens=options.suppress_tokens,
+                num_hypotheses=options.best_of,
             )
+        
+        # Print result for debugging
+        # print(f"\n\nResult: {result}\n\n")
+        
+        # Only process best hypothesis if return_nbest is False
+        if not hasattr(self, 'return_nbest') or not self.return_nbest:
+            best_hypotheses_batch = [segment_result.sequences_ids[0] for segment_result in result]
+            
+            def decode_batch(tokens_list: List[List[int]]) -> List[str]:
+                filtered_tokens = [[token for token in tokens if token < tokenizer.eot] for tokens in tokens_list]
+                return tokenizer.tokenizer.decode_batch(filtered_tokens)
 
-        tokens_batch = [x.sequences_ids[0] for x in result]
+            # Decode best hypotheses only
+            text = decode_batch(best_hypotheses_batch)
+            return text
+        
+        # Process all hypotheses if return_nbest is True
+        else:
+            all_hypotheses_batch = []
+            best_hypotheses_batch = []
+            
+            for segment_result in result:
+                # Get all sequences for this segment
+                segment_hypotheses = []
+                for hypothesis_tokens in segment_result.sequences_ids:
+                    # Filter tokens before decoding
+                    filtered_tokens = [token for token in hypothesis_tokens if token < tokenizer.eot]
+                    segment_hypotheses.append(filtered_tokens)
+                all_hypotheses_batch.append(segment_hypotheses)
+                # Also store best hypothesis separately
+                best_hypotheses_batch.append(segment_result.sequences_ids[0])
 
-        def decode_batch(tokens: List[List[int]]) -> str:
-            res = []
-            for tk in tokens:
-                res.append([token for token in tk if token < tokenizer.eot])
-            # text_tokens = [token for token in tokens if token < self.eot]
-            return tokenizer.tokenizer.decode_batch(res)
+            def decode_batch(tokens_list: List[List[int]]) -> List[str]:
+                filtered_tokens = [[token for token in tokens if token < tokenizer.eot] for tokens in tokens_list]
+                return tokenizer.tokenizer.decode_batch(filtered_tokens)
 
-        text = decode_batch(tokens_batch)
+            # Decode best hypotheses (equivalent to original text output)
+            text = decode_batch(best_hypotheses_batch)
+            
+            # Decode all hypotheses for each segment
+            all_decoded_hypotheses = []
+            for segment_hypotheses in all_hypotheses_batch:
+                decoded_segment_hypotheses = decode_batch(segment_hypotheses)
+                all_decoded_hypotheses.append(decoded_segment_hypotheses)
+            
+            # print(f"Best hypothesis text: {text}")
+            # print(f"All hypotheses: {all_decoded_hypotheses}")
 
-        return text
+            # Create a list of dictionaries containing both text and hypotheses
+            result = []
+            for t, h in zip(text, all_decoded_hypotheses):
+                result.append({"text": t, "hypotheses": h})
+
+            return result
 
     def encode(self, features: np.ndarray) -> ctranslate2.StorageView:
         # When the model is running on multiple GPUs, the encoder output should be moved
@@ -180,7 +225,6 @@ class FasterWhisperPipeline(Pipeline):
             for seg in segments:
                 f1 = int(seg['start'] * SAMPLE_RATE)
                 f2 = int(seg['end'] * SAMPLE_RATE)
-                # print(f2-f1)
                 yield {'inputs': audio[f1:f2]}
 
         vad_segments = self.vad_model({"waveform": torch.from_numpy(audio).unsqueeze(0), "sample_rate": SAMPLE_RATE})
@@ -190,6 +234,7 @@ class FasterWhisperPipeline(Pipeline):
             onset=self._vad_params["vad_onset"],
             offset=self._vad_params["vad_offset"],
         )
+        
         if self.tokenizer is None:
             language = language or self.detect_language(audio)
             task = task or "transcribe"
@@ -203,7 +248,7 @@ class FasterWhisperPipeline(Pipeline):
                 self.tokenizer = faster_whisper.tokenizer.Tokenizer(self.model.hf_tokenizer,
                                                                     self.model.model.is_multilingual, task=task,
                                                                     language=language)
-                
+                    
         if self.suppress_numerals:
             previous_suppress_tokens = self.options.suppress_tokens
             numeral_symbol_tokens = find_numeral_symbol_tokens(self.tokenizer)
@@ -215,21 +260,32 @@ class FasterWhisperPipeline(Pipeline):
         segments: List[SingleSegment] = []
         batch_size = batch_size or self._batch_size
         total_segments = len(vad_segments)
+        
         for idx, out in enumerate(self.__call__(data(audio, vad_segments), batch_size=batch_size, num_workers=num_workers)):
             if print_progress:
                 base_progress = ((idx + 1) / total_segments) * 100
                 percent_complete = base_progress / 2 if combined_progress else base_progress
                 print(f"Progress: {percent_complete:.2f}%...")
-            text = out['text']
+            
+            result = out['text']
             if batch_size in [0, 1, None]:
-                text = text[0]
-            segments.append(
-                {
-                    "text": text,
+                result = result[0] if isinstance(result, list) else result
+            
+            if isinstance(result, dict):  # return_nbest is True
+                segment = {
+                    "text": result["text"],
+                    "start": round(vad_segments[idx]['start'], 3),
+                    "end": round(vad_segments[idx]['end'], 3),
+                    "hypotheses": result["hypotheses"]
+                }
+            else:  # return_nbest is False
+                segment = {
+                    "text": result,
                     "start": round(vad_segments[idx]['start'], 3),
                     "end": round(vad_segments[idx]['end'], 3)
                 }
-            )
+            
+            segments.append(segment)
 
         # revert the tokenizer if multilingual inference is enabled
         if self.preset_language is None:
@@ -239,7 +295,10 @@ class FasterWhisperPipeline(Pipeline):
         if self.suppress_numerals:
             self.options = self.options._replace(suppress_tokens=previous_suppress_tokens)
 
-        return {"segments": segments, "language": language}
+        return {
+            "segments": segments,
+            "language": language
+        }
 
 
     def detect_language(self, audio: np.ndarray):
@@ -267,7 +326,10 @@ def load_model(whisper_arch,
                model : Optional[WhisperModel] = None,
                task="transcribe",
                download_root=None,
-               threads=4):
+               threads=4,
+               best_of=None, 
+               return_nbest=False
+               ):
     '''Load a Whisper model for inference.
     Args:
         whisper_arch: str - The name of the Whisper model to load.
@@ -286,11 +348,13 @@ def load_model(whisper_arch,
         language = "en"
 
     model = model or WhisperModel(whisper_arch,
-                         device=device,
-                         device_index=device_index,
-                         compute_type=compute_type,
-                         download_root=download_root,
-                         cpu_threads=threads)
+                            device=device,
+                            device_index=device_index,
+                            compute_type=compute_type,
+                            download_root=download_root,
+                            cpu_threads=threads,
+                            return_nbest=return_nbest
+                        )
     if language is not None:
         tokenizer = faster_whisper.tokenizer.Tokenizer(model.hf_tokenizer, model.model.is_multilingual, task=task, language=language)
     else:
@@ -327,7 +391,12 @@ def load_model(whisper_arch,
 
     if asr_options is not None:
         default_asr_options.update(asr_options)
-
+        
+    # override best of if specified (and beam size)
+    if best_of is not None:
+        default_asr_options["best_of"] = best_of
+        default_asr_options["beam_size"] = best_of
+        
     suppress_numerals = default_asr_options["suppress_numerals"]
     del default_asr_options["suppress_numerals"]
 
